@@ -26,13 +26,10 @@ from diffusers.utils import load_image
 import settings
 from stable_diffusion_controlnet_img2img import StableDiffusionControlNetImg2ImgPipeline
 
-# upscale
-os.system('pip install realesrgan')
-from basicsr.archs.srvgg_arch import SRVGGNetCompact
-from gfpgan import GFPGANer
-from realesrgan.utils import RealESRGANer
-import numpy as np
+# ESRGAN
 from PIL import Image
+import numpy as np
+from RealESRGAN import RealESRGAN
 
 class Predictor(BasePredictor):
     def setup(self):
@@ -43,42 +40,13 @@ class Predictor(BasePredictor):
             self.real = False
             return
 
-        # upscale
-        os.makedirs('output', exist_ok=True)
-        # download weights
-        if not os.path.exists('gfpgan/weights/realesr-general-x4v3.pth'):
-            os.system(
-                'wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth -P ./gfpgan/weights'
-            )
-        if not os.path.exists('gfpgan/weights/GFPGANv1.2.pth'):
-            os.system(
-                'wget https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.2.pth -P ./gfpgan/weights')
-        if not os.path.exists('gfpgan/weights/GFPGANv1.3.pth'):
-            os.system(
-                'wget https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth -P ./gfpgan/weights')
-        if not os.path.exists('gfpgan/weights/GFPGANv1.4.pth'):
-            os.system(
-                'wget https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth -P ./gfpgan/weights')
-        if not os.path.exists('gfpgan/weights/RestoreFormer.pth'):
-            os.system(
-                'wget https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/RestoreFormer.pth -P ./gfpgan/weights'
-            )
+        self.models = {}
 
-        # background enhancer with RealESRGAN
-        model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type='prelu')
-        model_path = 'gfpgan/weights/realesr-general-x4v3.pth'
-        half = True if torch.cuda.is_available() else False
-        self.upsampler = RealESRGANer(
-            scale=4, model_path=model_path, model=model, tile=0, tile_pad=10, pre_pad=0, half=half)
-
-        # Use GFPGAN for face enhancement
-        self.face_enhancer = GFPGANer(
-            model_path='gfpgan/weights/GFPGANv1.4.pth',
-            upscale=2,
-            arch='clean',
-            channel_multiplier=2,
-            bg_upsampler=self.upsampler)
-        self.current_version = 'v1.4'
+        for scale in [2, 4, 8]:
+            self.models[scale] = RealESRGAN("cuda", scale=scale)
+            self.models[scale].load_weights(
+                f"esrgan_weights/RealESRGAN_x{scale}.pth", download=True
+            )
 
         print("Loading pose...")
         self.openpose = OpenposeDetector.from_pretrained(
@@ -241,50 +209,14 @@ class Predictor(BasePredictor):
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
-        version: str = Input(
-            description='GFPGAN version. v1.3: better quality. v1.4: more details and better identity.',
-            choices=['v1.2', 'v1.3', 'v1.4', 'RestoreFormer'],
-            default='v1.4'),
-        scale: float = Input(description='Rescaling factor', default=2),
+        upscale: int = Input(
+            choices=[2, 4, 8], description="Upscaling factor", default=4
+        ),
     ) -> Iterator[Path]:
         """Run a single prediction on the model"""
 
         if not self.real:
             raise RuntimeError("This is a template, not a real model - add weights")
-
-        # upscale
-        if self.current_version != version:
-            if version == 'v1.2':
-                self.face_enhancer = GFPGANer(
-                    model_path='gfpgan/weights/GFPGANv1.2.pth',
-                    upscale=2,
-                    arch='clean',
-                    channel_multiplier=2,
-                    bg_upsampler=self.upsampler)
-                self.current_version = 'v1.2'
-            elif version == 'v1.3':
-                self.face_enhancer = GFPGANer(
-                    model_path='gfpgan/weights/GFPGANv1.3.pth',
-                    upscale=2,
-                    arch='clean',
-                    channel_multiplier=2,
-                    bg_upsampler=self.upsampler)
-                self.current_version = 'v1.3'
-            elif version == 'v1.4':
-                self.face_enhancer = GFPGANer(
-                    model_path='gfpgan/weights/GFPGANv1.4.pth',
-                    upscale=2,
-                    arch='clean',
-                    channel_multiplier=2,
-                    bg_upsampler=self.upsampler)
-                self.current_version = 'v1.4'
-            elif version == 'RestoreFormer':
-                self.face_enhancer = GFPGANer(
-                    model_path='gfpgan/weights/RestoreFormer.pth',
-                    upscale=2,
-                    arch='RestoreFormer',
-                    channel_multiplier=2,
-                    bg_upsampler=self.upsampler)
 
         if image:
             image = self.load_image(image)
@@ -386,12 +318,10 @@ class Predictor(BasePredictor):
             if output.nsfw_content_detected and output.nsfw_content_detected[0]:
                 continue
 
-            output_np = np.array(output.images[0])
-            _, _, output = self.face_enhancer.enhance(output_np, has_aligned=False, only_center_face=False, paste_back=True, weight=0.5)
-            output_pil = Image.fromarray(output)
-
+            model = self.models[upscale]
+            sr_image = model.predict( output.images[0])
             output_path = f"/tmp/seed-{this_seed}.png"
-            output_pil.save(output_path)
+            sr_image.save(output_path)
             yield Path(output_path)
             result_count += 1
 
